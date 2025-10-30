@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-# CTOOL.py -- Full tool (menu, config, monitor) with ARES logo (green/yellow)
-# Tích hợp WebSocket (asyncio), Logic Cầu Bệt, và Phím 'q' để Dừng.
-#
-# Cài đặt: pip install colorama websockets
-# Chạy:     python3 CTOOL_full.py
-#
+# CTOOL.py -- Phiên bản gộp WebSocket (ARES)
+# Yêu cầu: pip install colorama requests websocket-client
 
 import os
 import re
@@ -12,28 +8,398 @@ import sys
 import time
 import json
 import random
-import asyncio  # Thêm asyncio
-import websockets # Thêm websockets
+import requests   # <-- THÊM MỚI
+import websocket  # <-- THÊM MỚI
+import threading  # <-- THÊM MỚI
 from datetime import datetime
 from colorama import Fore, Style, init
-from collections import deque
-# Threading để lắng nghe phím 'q'
-import threading
 
 init(autoreset=True)
 
 # ----------------- Config / Defaults -----------------
 CONFIG_FILE = "config.json"
+MONITOR_ID = random.randint(100000, 999999)
 
+# [QUAN TRỌNG] TÔI ĐÃ THÊM THẲNG CÁC KEY CỦA BẠN VÀO ĐÂY
 DEFAULT_CONFIG = {
-    "user_id": "",
-    "secret_key": "",
+    "user_id": "4735716",
+    "secret_key": "94621ef380ad5941a816d89904603cb17a81dab2750ba7d9f0e15a6d8dc7012f",
+    
+    # URL "Cái Tay" (Để đặt cược)
+    "url_dat_cuoc": "https://api.escapemaster.net/escape_game/bet",
+    
+    # URL "Cái Tai" (Để nghe)
+    "url_websocket": "wss://api.escapemaster.net/escape_game/ws",
+    
+    # Origin (Server gốc, RẤT QUAN TRỌNG)
+    "origin": "https://escapemaster.net", 
+
     "webhook": "",
     "send_webhook": False,
-    "currency": "BUILD",
+    "currency": "BUILD", # Bạn cần kiểm tra lại xem API có cần 'currency' không
     "amount": 10,
-    "multiplier": 1.0,
-    "pause_after": 1,
+    
+    # Cài đặt "Não"
+    "min_streak_length": 3, # Chờ 3 ván bệt liên tiếp mới theo
+    
+    "pause_after": 999,
+    "pause_len": 0,
+    "logic": 1 # Logic giờ sẽ là "Theo Cầu Bệt"
+}
+
+# ----------------- Runtime state (Toàn cục) -----------------
+# Các biến này sẽ được chia sẻ giữa "Tai" và "Não"
+state = {
+    "wins": 0,
+    "losses": 0,
+    "rounds_played": 0, # Số vòng đã cược
+    "current_chain": 0,
+    "max_chain": 0,
+    "profit": 0.0,
+    "lich_su_thang": [] # DANH SÁCH CÁC PHÒNG THẮNG GẦN NHẤT
+}
+# Biến này để lưu config đang chạy
+current_config = {}
+
+# ----------------- ARES LOGO (green + yellow) -----------------
+LOGO = f"""
+{Fore.GREEN}    █████╗ ██████╗ ███████╗███████╗
+   ██╔══██╗██╔══██╗██╔════╝██╔════╝
+   ███████║██████╔╝█████╗  ███████╗
+   ██╔══██║██╔══██╗██╔══╝  ╚════██║
+   ██║  ██║██║  ██║███████╗███████║
+   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝
+{Fore.YELLOW}               POWERED BY ARES TOOL
+{Style.RESET_ALL}
+"""
+
+# ----------------- Utilities -----------------
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def load_config():
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            # fill missing keys
+            for k, v in DEFAULT_CONFIG.items():
+                if k not in cfg:
+                    cfg[k] = v
+            return cfg
+        except Exception:
+            return DEFAULT_CONFIG.copy()
+    else:
+        return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(Fore.RED + "Lỗi khi lưu config:", e)
+
+# (Hàm parse_link_extract không cần thiết nữa vì bạn đã có key)
+
+# ----------------- UI components -----------------
+# (Giữ nguyên print_main_screen, show_link_instructions)
+def print_main_screen(cfg):
+    clear()
+    print(LOGO)
+    print(Fore.BLUE + "YouTube".ljust(12) + ":" + Style.RESET_ALL, "https://www.youtube.com/@CTOOL")
+    print(Fore.BLUE + "TikTok".ljust(12) + ":" + Style.RESET_ALL, "https://www.tiktok.com/@ctool7929")
+    print(Fore.BLUE + "Zalo Group".ljust(12) + ":" + Style.RESET_ALL, "https://zalo.me/g/qowvzu729")
+    print(Fore.BLUE + "Telegram".ljust(12) + ":" + Style.RESET_ALL, "https://t.me/+PByWNy8hDxYzYTRl")
+    print(Fore.BLUE + "Admin".ljust(12) + ":" + Style.RESET_ALL, "Thành Công\n")
+    print(Fore.GREEN + "1. Tool vua thoát hiểm")
+    print(Fore.GREEN + "2. Cấu hình tài khoản chạy tool")
+    print(Fore.GREEN + "3. Cấu hình webhook")
+    print(Fore.GREEN + "4. Bảng giám sát (chạy tool)")
+    print(Fore.GREEN + "q. Thoát" + Style.RESET_ALL)
+    print("\nNhập : ", end="", flush=True)
+
+# ----------------- Logic "Não" -----------------
+def logic_theo_cau_bet(lich_su):
+    """
+    Logic 1: Theo Cầu Bệt.
+    Phân tích lịch sử và trả về TÊN phòng, hoặc "SKIP".
+    """
+    min_streak = current_config.get("min_streak_length", 3)
+    
+    print(f"[NÃO]: Đang phân tích lịch sử: {lich_su[-5:]}") # In 5 ván cuối
+    
+    if len(lich_su) < min_streak:
+        print("[NÃO]: Không đủ dữ liệu lịch sử.")
+        return "SKIP"
+
+    # Lấy N kết quả gần nhất
+    cac_van_gan_nhat = lich_su[-min_streak:]
+    
+    # Kiểm tra xem tất cả có giống nhau không
+    phong_dau_tien = cac_van_gan_nhat[0]
+    la_cau_bet = all(ket_qua == phong_dau_tien for ket_qua in cac_van_gan_nhat)
+
+    if la_cau_bet:
+        print(f"[NÃO]: PHÁT HIỆN CẦU BỆT! Quyết định cược vào -> {phong_dau_tien}")
+        return phong_dau_tien # Tên của phòng đang bệt
+    else:
+        print("[NÃO]: Không có cầu bệt rõ ràng.")
+        return "SKIP"
+
+# ----------------- Logic "Tay" (Hành động thật) -----------------
+def place_real_bet(room_id, room_name):
+    """
+    Hàm này dùng "Tay" (requests) để gửi lệnh đặt cược.
+    """
+    cfg = current_config # Lấy config đang chạy
+    
+    # [QUAN TRỌNG] Tạo headers với các key BẠN ĐÃ TÌM THẤY
+    headers = {
+        'user-id': cfg['user_id'],
+        'user-secret-key': cfg['secret_key'],
+        'origin': cfg['origin'],
+        'User-Agent': 'Mozilla/5.0 ... (Thêm User-Agent của bạn)'
+    }
+    
+    # [QUAN TRỌNG] Tạo payload
+    # (TODO: Bạn cần kiểm tra lại xem payload có cần 'currency' không)
+    payload = {
+        'roomId': room_id, # ID của phòng, ví dụ 1, 2, 3...
+        'amount': cfg['amount']
+    }
+    
+    try:
+        print(Fore.YELLOW + f"!!! [TAY]: Đang cược {payload['amount']} vào phòng {room_name} (ID: {room_id}) !!!")
+        response = requests.post(cfg['url_dat_cuoc'], headers=headers, json=payload)
+        
+        if response.status_code == 200:
+            print(Fore.GREEN + "[TAY]: Đặt cược THÀNH CÔNG.")
+            state["rounds_played"] += 1
+        else:
+            print(Fore.RED + f"[TAY]: LỖI ĐẶT CƯỢC. Server: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(Fore.RED + f"[LỖI API]: Không thể đặt cược: {e}")
+
+# ----------------- Logic "Tai" (WebSocket) -----------------
+
+def on_message(ws, message):
+    """
+    Đây là "CÁI TAI". Nó Lắng nghe mọi thứ server nói.
+    """
+    global state
+    print(Fore.CYAN + f"\n[TAI]: Nhận được tin nhắn từ server:" + Style.RESET_ALL)
+    print(message) # In ra để debug
+    
+    try:
+        data = json.loads(message)
+        
+        # [TODO] ĐÂY LÀ PHẦN QUAN TRỌNG NHẤT BẠN CẦN CHÚ Ý
+        # Tôi đang "ĐOÁN" cấu trúc tin nhắn JSON mà server gửi.
+        # Bạn hãy chạy tool và xem tin nhắn thật (ở dòng "print(message)")
+        # rồi sửa lại 'data['type']' 'data['winner']' cho đúng.
+        
+        # --- KỊCH BẢN 1: Server báo KẾT QUẢ VÁN TRƯỚC ---
+        # (Tôi đoán tin nhắn có 'type' là 'ROUND_RESULT' hoặc 'winner')
+        if 'winner' in data or data.get('type') == 'ROUND_RESULT':
+            # (Giả sử data['winner'] là một object: {'name': 'Phòng họp', 'id': 2})
+            winning_room = data.get('winner', data) 
+            winning_room_name = winning_room.get('name', 'N/A')
+            
+            print(Fore.GREEN + f"[KẾT QUẢ]: Vòng trước thắng: {winning_room_name}")
+            state["lich_su_thang"].append(winning_room_name)
+            
+            # (Bạn có thể thêm code kiểm tra thắng/thua ở đây)
+
+        # --- KỊCH BẢN 2: Server báo VÒNG MỚI BẮT ĐẦU ---
+        # (Tôi đoán tin nhắn có 'type' là 'NEW_ROUND' hoặc 'rooms')
+        elif 'rooms' in data or data.get('type') == 'NEW_ROUND':
+            print(Fore.CYAN + "[HÀNH ĐỘNG]: Vòng mới bắt đầu, chạy bộ não phân tích...")
+            
+            # Lấy danh sách phòng từ tin nhắn
+            # (Giả sử data['rooms'] là list: [{'id': 1, 'name': 'Nhà kho'}, ...])
+            danh_sach_phong_hien_tai = data.get('rooms', [])
+            if not danh_sach_phong_hien_tai:
+                print(Fore.RED + "Lỗi: Tin nhắn vòng mới không có 'rooms'!")
+                return
+
+            # 1. Chạy "Não"
+            quyet_dinh = logic_theo_cau_bet(state["lich_su_thang"])
+            
+            if quyet_dinh != "SKIP":
+                # 2. Tìm ID phòng từ TÊN phòng
+                room_to_bet = None
+                for phong in danh_sach_phong_hien_tai:
+                    if phong.get('name') == quyet_dinh:
+                        room_to_bet = phong
+                        break
+                
+                if room_to_bet:
+                    # 3. Chạy "Tay"
+                    place_real_bet(room_to_bet['id'], room_to_bet['name'])
+                else:
+                    print(f"[LỖI]: Não chọn '{quyet_dinh}' nhưng không tìm thấy phòng này trong danh sách!")
+            else:
+                print(f">>> QUYẾT ĐỊNH: BỎ QUA (SKIP) VÒNG NÀY <<<")
+        
+        # In ra bảng trạng thái (nếu cần)
+        print(f"Lịch sử thắng: {state['lich_su_thang'][-10:]}")
+        print(f"Rounds: {state['rounds_played']} | Thắng: {state['wins']} | Thua: {state['losses']} | Lời: {state['profit']:.2f}")
+
+    except json.JSONDecodeError:
+        print(Fore.RED + "[LỖI TAI]: Server gửi tin nhắn không phải JSON.")
+    except Exception as e:
+        print(Fore.RED + f"[LỖI XỬ LÝ]: {e}")
+
+
+def on_error(ws, error):
+    print(Fore.RED + f"[LỖI WS]: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    print(Fore.YELLOW + "!!! Mất kết nối WebSocket. Đang thử kết nối lại sau 10s...")
+    time.sleep(10)
+    # Thử chạy lại
+    run_monitor(current_config) 
+
+def on_open(ws):
+    print(Fore.GREEN + "--- ĐÃ KẾT NỐI VỚI SERVER GAME (WebSocket) ---")
+    # (Một số game có thể yêu cầu gửi 1 tin nhắn 'init' ở đây)
+    # ws.send(json.dumps({"action": "subscribe"}))
+
+# ----------------- Monitor main loop -----------------
+def run_monitor(cfg):
+    global current_config, state
+    # Lưu config để các hàm khác dùng
+    current_config = cfg
+    
+    # Reset state khi bắt đầu
+    state = {key: (0 if isinstance(v, (int, float)) else []) for key, v in state.items()}
+
+    print("--- TOOL TỰ ĐỘNG KHỞI CHẠY (Chế độ WebSocket) ---")
+    print(f"Số tiền đặt: {cfg['amount']} {cfg['currency']}")
+    print(f"Logic: Theo cầu bệt (chờ {cfg['min_streak_length']} ván)")
+    print(f"Kết nối với ID: {cfg['user_id']}")
+    
+    # [QUAN TRỌNG] Tạo headers cho WebSocket
+    # (Giống hệt headers bạn tìm thấy)
+    headers = {
+        'user-id': cfg['user_id'],
+        'user-secret-key': cfg['secret_key'],
+        'origin': cfg['origin'],
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36'
+    }
+    
+    # Khởi tạo "Cái Tai"
+    ws_app = websocket.WebSocketApp(
+        cfg['url_websocket'],
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        header=headers
+    )
+    
+    try:
+        # Chạy "Cái Tai" (Nó sẽ chạy mãi mãi, block ở đây)
+        # Nó sẽ tự động gọi 'on_message' khi có tin nhắn
+        ws_app.run_forever()
+    except KeyboardInterrupt:
+        ws_app.close()
+        print("\n" + Fore.YELLOW + "Đã dừng. Quay lại menu chính." + Style.RESET_ALL)
+        time.sleep(0.6)
+
+# ----------------- Configuration flows -----------------
+def configure_account_flow(cfg):
+    clear()
+    print(LOGO)
+    print(Fore.YELLOW + "---Cấu hình tài khoản chạy tool---" + Style.RESET_ALL)
+    print(Fore.CYAN + "Các 'chìa khóa' của bạn đã được điền sẵn.")
+    print(Fore.CYAN + "Nhấn Enter để bỏ qua nếu không muốn thay đổi.")
+    
+    # Các câu hỏi, với giá trị mặc định là key của bạn
+    cfg["user_id"] = input(Fore.YELLOW + f"Nhập user_id [{cfg['user_id']}]: " + Style.RESET_ALL).strip() or cfg["user_id"]
+    cfg["secret_key"] = input(Fore.YELLOW + f"Nhập user_secret_key [{cfg['secret_key'][:10]}...]: " + Style.RESET_ALL).strip() or cfg["secret_key"]
+    cfg["url_dat_cuoc"] = input(Fore.YELLOW + f"Nhập URL đặt cược [{cfg['url_dat_cuoc']}]: " + Style.RESET_ALL).strip() or cfg["url_dat_cuoc"]
+    cfg["url_websocket"] = input(Fore.YELLOW + f"Nhập URL WebSocket [{cfg['url_websocket']}]: " + Style.RESET_ALL).strip() or cfg["url_websocket"]
+    
+    print()
+    print("1. BUILD\n2. USDT\n3. WORLD")
+    while True:
+        c = input(Fore.YELLOW + "Chọn loại tiền bạn muốn chơi (1/2/3): " + Style.RESET_ALL).strip()
+        if c in ("1","2","3"):
+            cfg["currency"] = {"1":"BUILD","2":"USDT","3":"WORLD"}[c]
+            break
+        else:
+            print("Nhập 1/2/3.")
+    while True:
+        v = input(Fore.YELLOW + f"Nhập số lượng {cfg['currency']} để đặt (vd 10): " + Style.RESET_ALL).strip()
+        try:
+            val = float(v)
+            if val > 0:
+                cfg["amount"] = val
+                break
+        except:
+            pass
+        print("Nhập số hợp lệ > 0.")
+    while True:
+        v = input(Fore.YELLOW + "Chờ tối thiểu bao nhiêu ván bệt thì theo (vd 3): " + Style.RESET_ALL).strip()
+        try:
+            cfg["min_streak_length"] = int(v)
+            break
+        except:
+            print("Nhập số nguyên.")
+
+    print()
+    w = input(Fore.YELLOW + "Nhập webhook URL (Enter để bỏ qua): " + Style.RESET_ALL).strip()
+    if w:
+        cfg["webhook"] = w
+        cfg["send_webhook"] = input("Bật gửi webhook? (y/n): ").strip().lower() == "y"
+    
+    save_config(cfg)
+    print(Fore.GREEN + "Đã lưu cấu hình vào config.json" + Style.RESET_ALL)
+    input("Nhấn Enter để quay lại menu...")
+
+def configure_webhook(cfg):
+    # (Giữ nguyên hàm này)
+    clear()
+    print(LOGO)
+    print(Fore.YELLOW + "---Cấu hình webhook---" + Style.RESET_ALL)
+    w = input("Webhook URL: ").strip()
+    if w:
+        cfg["webhook"] = w
+    cfg["send_webhook"] = input("Bật gửi webhook? (y/n): ").strip().lower() == "y"
+    save_config(cfg)
+    print("Đã lưu.")
+    input("Nhấn Enter ...")
+
+# ----------------- Main program -----------------
+def main():
+    cfg = load_config()
+    while True:
+        print_main_screen(cfg)
+        ch = input().strip().lower()
+        if ch == "1" or ch == "4": # Gộp 1 và 4
+            run_monitor(cfg)
+        elif ch == "2":
+            configure_account_flow(cfg)
+        elif ch == "3":
+            configure_webhook(cfg)
+        elif ch in ("q","quit","exit"):
+            print("Bye.")
+            break
+        else:
+            print("Nhập 1/2/3/4 hoặc q.")
+            time.sleep(0.6)
+        clear()
+
+if __name__ == "__main__":
+    try:
+        print("Vui lòng cài đặt thư viện nếu chưa có:")
+        print(Fore.YELLOW + "pip install requests websocket-client")
+        print(Style.RESET_ALL)
+        main()
+    except KeyboardInterrupt:
+        print("\nThoát chương trình.")
     "pause_len": 1,
     "logic": 1,
     "auto_start_monitor": False,
